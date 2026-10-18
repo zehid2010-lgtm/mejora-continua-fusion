@@ -1,0 +1,84 @@
+name: Actualizar datos Fusion
+on:
+  repository_dispatch:
+    types: [update_fusion]
+permissions:
+  contents: write
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Preparar receptor
+        run: |
+          cat > /tmp/receive_fusion.py <<'PY'
+          import json, os, hashlib, pathlib, datetime
+          p = json.load(open(os.environ["GITHUB_EVENT_PATH"]))["client_payload"]
+          def require(ok, message):
+              if not ok: raise ValueError(message)
+          def datekey(s):
+              return datetime.datetime.strptime(s, "%d/%m/%Y").date()
+          require(p.get("schemaVersion") == 1, "Version incorrecta")
+          batch = p["batchId"]
+          datetime.datetime.fromisoformat(batch.replace("Z", "+00:00"))
+          datekey(p["date"])
+          n, i, total = p["totalBlocks"], p["blockIndex"], p["totalClients"]
+          require(type(n) is int and 1 <= n <= 100, "Cantidad de bloques incorrecta")
+          require(type(i) is int and 0 <= i < n, "Indice incorrecto")
+          require(type(total) is int and 1 <= total <= 10000, "Cantidad de clientes incorrecta")
+          require(isinstance(p["clients"], list) and 1 <= len(p["clients"]) <= 100, "Bloque incorrecto")
+          sizes = [1,1,2,2,2,1,2,2]
+          for c in p["clients"]:
+              require(isinstance(c.get("id"), str) and c["id"].isdigit(), "Codigo incorrecto")
+              require(isinstance(c.get("name"), str) and bool(c["name"].strip()), "Nombre incorrecto")
+              require(c.get("route") in ["40","41","42","43","44","45"], "Ruta incorrecta")
+              require(isinstance(c.get("days"), str), "Dias incorrectos")
+              parts = c.get("parts")
+              require(isinstance(parts, list) and len(parts) == 8, "Indicadores incorrectos")
+              for values, size in zip(parts, sizes):
+                  require(isinstance(values, list) and len(values) == size and all(type(v) is int and v in [0,1] for v in values), "Condiciones incorrectas")
+          root = pathlib.Path(".fusion-incoming")
+          folder = root / hashlib.sha256(batch.encode()).hexdigest()
+          folder.mkdir(parents=True, exist_ok=True)
+          target = folder / (str(i) + ".json")
+          if target.exists():
+              require(json.loads(target.read_text()) == p, "Bloque duplicado con contenido distinto")
+          target.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+          files = [folder / (str(k) + ".json") for k in range(n)]
+          if all(f.exists() for f in files):
+              blocks = [json.loads(f.read_text()) for f in files]
+              for k, b in enumerate(blocks):
+                  require(all(b.get(key) == p.get(key) for key in ["schemaVersion","batchId","date","totalBlocks","totalClients"]) and b["blockIndex"] == k, "Bloques incompatibles")
+              clients = [c for b in blocks for c in b["clients"]]
+              require(len(clients) == total and len({c["id"] for c in clients}) == total, "Clientes incompletos o duplicados")
+              datafile = pathlib.Path("data.json")
+              current = json.loads(datafile.read_text()) if datafile.exists() else {}
+              newer = not current.get("date") or datekey(p["date"]) > datekey(current["date"])
+              same = current.get("date") == p["date"] and batch >= current.get("batchId", "")
+              if newer or same:
+                  datafile.write_text(json.dumps({"clients":clients,"date":p["date"],"batchId":batch}, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
+                  print("Reporte completo: " + str(total) + " clientes, corte " + p["date"])
+              else:
+                  print("Reporte anterior conservado sin reemplazar los datos mas recientes")
+          else:
+              print("Bloque recibido; esperando los restantes")
+          PY
+      - name: Recibir bloque y guardar con reintentos
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for attempt in $(seq 1 15); do
+            git fetch origin main
+            git reset --hard origin/main
+            python /tmp/receive_fusion.py || exit 1
+            git add .fusion-incoming data.json
+            if git diff --cached --quiet; then exit 0; fi
+            git commit -m "Actualizar bloque de cobertura Fusion"
+            if git push origin HEAD:main; then exit 0; fi
+            sleep $((RANDOM % 5 + 1))
+          done
+          echo "No se pudo guardar el bloque tras los reintentos"
+          exit 1
